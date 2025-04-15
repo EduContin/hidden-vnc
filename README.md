@@ -106,5 +106,6 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 
 ---
 
-**Author:** [Eduardo Contin]
+**Author:** Eduardo Contin
+
 **Contact:** <eduardo.contin.04@gmail.com> 
