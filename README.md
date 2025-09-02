@@ -5,7 +5,7 @@
 ---
 
 > **Disclaimer:**
-> This project is intended **solely for educational and research purposes**. Unauthorized use on systems you do not own or have explicit permission to test is strictly prohibited. The author assumes no liability for any misuse or damage caused by this code.
+> This project is intended **solely for educational and research purposes**! Unauthorized use on systems you do not own or have explicit permission to test is strictly prohibited. The author assumes no liability for any misuse or damage caused by this code.
 
 ---
 
